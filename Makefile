@@ -55,7 +55,7 @@ EXT =
 endif
 
 # automatically enable runtime vector dispatch on x86/64 targets
-detect_x86_arch = $(shell $(CC) -dumpmachine | grep -E 'i[3-6]86|x86_64')
+detect_x86_arch = $(shell $(CC) $(CFLAGS) -dumpmachine | grep -E 'i[3-6]86|x86_64')
 ifneq ($(strip $(call detect_x86_arch)),)
     #note: can be overridden at compile time, by setting DISPATCH=0
     DISPATCH ?= 1
@@ -139,14 +139,15 @@ $(eval $(call c_program,xxhsum_inlinedXXH,$(CLI_OBJS)))
 # =================================================
 # library
 
+LIBXXHASH_OBJS := xxhash.o $(if $(filter 1,$(LIBXXH_DISPATCH)),xxh_x86dispatch.o)
+
 libxxhash.a:
-$(eval $(call static_library,libxxhash.a,xxhash.o))
+$(eval $(call static_library,libxxhash.a,$(LIBXXHASH_OBJS)))
 
 $(LIBXXH): LDFLAGS += $(SONAME_FLAGS)
 ifeq (,$(filter Windows%,$(OS)))
 $(LIBXXH): CFLAGS += -fPIC
 endif
-LIBXXHASH_OBJS := xxhash.o $(if $(filter 1,$(LIBXXH_DISPATCH)),xxh_x86dispatch.o)
 $(eval $(call c_dynamic_library,$(LIBXXH),$(LIBXXHASH_OBJS)))
 
 libxxhash.$(SHARED_EXT_MAJOR): $(LIBXXH)
@@ -240,10 +241,21 @@ test-mem: xxhsum check
 test32: xxhsum32
 	@echo ---- test 32-bit ----
 	./xxhsum32 -bi0 xxhash.c
+	./xxhsum32 -bi0 -B4294967277 2>&1 | $(GREP) "Error: benchmark block size is too large"
 
 TEST_FILES = xxhsum$(EXT) xxhash.c xxhash.h
 .PHONY: test-xxhsum-c
 test-xxhsum-c: xxhsum
+	# --seed requires a value
+	./xxhsum --seed 2>&1 | $(GREP) -q "^Wrong parameters"
+	./xxhsum -H0 --seed 2>&1 | $(GREP) -q "^Wrong parameters"
+	# --seed is independent of option order
+	test "$$(./xxhsum -H0 --seed 1234 Makefile)" = "$$(./xxhsum --seed 1234 -H0 Makefile)"
+	# -s# is equivalent to --seed #
+	test "$$(./xxhsum -H0 --seed 1234 Makefile)" = "$$(./xxhsum -H0 -s1234 Makefile)"
+	test "$$(./xxhsum -H1 --seed 4294967296 Makefile)" = "$$(./xxhsum -H1 -s4294967296 Makefile)"
+	# --seed applies to every algorithm detected by --check
+	{ ./xxhsum -H0 --seed 1234 Makefile; ./xxhsum -H1 --seed 1234 Makefile; } | ./xxhsum --seed 1234 -c -
 	# xxhsum to/from pipe
 	./xxhsum $(TEST_FILES) | ./xxhsum -c -
 	./xxhsum -H0 $(TEST_FILES) | ./xxhsum -c -
@@ -256,6 +268,17 @@ test-xxhsum-c: xxhsum
 	! ./xxhsum $(TEST_FILES) 2>&1 | grep Loading
 	# Check that xxhsum do display filename that it failed to open.
 	LC_ALL=C ./xxhsum nonexistent 2>&1 | grep "Error: Could not open 'nonexistent'"
+	# A read error must not prevent subsequent files from being hashed (#1064).
+	@if test -r /proc/self/mem; then \
+		./xxhsum Makefile > .test.read-error.expected || exit 1; \
+		if ./xxhsum /proc/self/mem Makefile > .test.read-error.actual; then \
+			echo "Expected /proc/self/mem to fail while reading" >&2; \
+			exit 1; \
+		fi; \
+		diff -u .test.read-error.expected .test.read-error.actual; \
+	else \
+		echo "Skipping read-error test: /proc/self/mem is unavailable"; \
+	fi
 	# xxhsum to/from file, shell redirection
 	./xxhsum $(TEST_FILES) > .test.xxh64
 	./xxhsum --tag $(TEST_FILES) > .test.xxh64_tag
@@ -273,6 +296,13 @@ test-xxhsum-c: xxhsum
 	./xxhsum -H3 --tag $(TEST_FILES) > .test.xxh3_tag
 	./xxhsum -H3 --little-endian $(TEST_FILES) > .test.le_xxh3
 	./xxhsum -H3 --tag --little-endian $(TEST_FILES) > .test.le_xxh3_tag
+	# --quiet works before and after the checksum filename (#1098)
+	test -z "$$(./xxhsum --quiet -c .test.xxh64)"
+	test -z "$$(./xxhsum -c .test.xxh64 --quiet)"
+	test -z "$$(./xxhsum -c .test.xxh64 -q)"
+	# -- stops option processing, including after a filename
+	LC_ALL=C ./xxhsum -c .test.xxh64 -- --quiet 2>&1 | $(GREP) -q "Could not open '--quiet':"
+	! LC_ALL=C ./xxhsum -c .test.xxh64 -- --quiet 2>&1 | $(GREP) -q "Could not open '--':"
 	./xxhsum -c .test.xxh*
 	./xxhsum -c --little-endian .test.le_xxh*
 	./xxhsum -c .test.*_tag
@@ -455,11 +485,22 @@ namespaceTest:  ## ensure XXH_NAMESPACE redefines all public symbols
 MAN = $(CLI_DIR)/xxhsum.1
 MD2ROFF ?= ronn
 MD2ROFF_FLAGS ?= --roff --warnings --manual="User Commands" --organization="xxhsum $(XXHSUM_VERSION)"
+VERSION_SYNC = build/update_version.sh
 $(MAN): $(CLI_DIR)/xxhsum.1.md xxhash.h
 	cat $< | $(MD2ROFF) $(MD2ROFF_FLAGS) | $(SED) -n '/^\.\\\".*/!p' > $@
 
 .PHONY: man
 man: $(MAN)  ## generate man page from markdown source
+
+.PHONY: update-version
+update-version:  ## synchronize version metadata with xxhash.h
+	$(SHELL) $(VERSION_SYNC) "$(LIBVER)"
+	$(MAKE) -B man
+	$(SHELL) $(VERSION_SYNC) --check "$(LIBVER)"
+
+.PHONY: check-version
+check-version:  ## check version metadata against xxhash.h
+	$(SHELL) $(VERSION_SYNC) --check "$(LIBVER)"
 
 .PHONY: clean-man
 clean-man:
@@ -483,8 +524,13 @@ test-inline-notexposed: xxhsum_inlinedXXH
 	$(NM) xxhsum_inlinedXXH | $(GREP) "t _XXH32_" ; test $$? -eq 1  # no XXH32 symbol should be left
 	$(NM) xxhsum_inlinedXXH | $(GREP) "t _XXH64_" ; test $$? -eq 1  # no XXH64 symbol should be left
 
+# this test checks that a unit requesting XXH_INLINE_ALL can nonetheless employ the x86 dispatcher
+.PHONY: test-inline-dispatch
+test-inline-dispatch:
+	$(MAKE) -C tests test_inline_dispatch
+
 .PHONY: test-inline
-test-inline: test-inline-notexposed test-multiInclude
+test-inline: test-inline-notexposed test-multiInclude test-inline-dispatch
 
 
 .PHONY: test-all
@@ -492,7 +538,7 @@ test-all: CFLAGS += -Werror
 test-all: test test32 test-unicode clangtest gcc-og-test cxxtest usan test-inline listL120 trailingWhitespace test-xxh-nnn-sums
 
 .PHONY: test-tools
-test-tools:
+test-tools: check-version
 	CFLAGS=-Werror $(MAKE) -C tests/bench
 	CFLAGS=-Werror $(MAKE) -C tests/collisions check
 
